@@ -16,12 +16,14 @@
 #include <linux/compiler_types.h>
 #include <linux/hashtable.h>
 #include <linux/kref.h>
+#include <linux/kthread.h>
 
 #include "klog.h" // IWYU pragma: keep
 #include "ksu.h"
 #include "runtime/ksud_boot.h"
 #include "selinux/selinux.h"
 #include "policy/allowlist.h"
+#include "policy/app_profile.h"
 #include "manager/manager_identity.h"
 #include "infra/su_mount_ns.h"
 
@@ -423,8 +425,7 @@ bool ksu_get_allow_list(int *array, u16 length, u16 *out_length, u16 *out_total,
     return true;
 }
 
-// TODO: move to kernel thread or work queue
-static void do_persistent_allow_list(struct callback_head *_cb)
+static inline void do_persistent_allow_list()
 {
     u32 magic = FILE_MAGIC;
     u32 version = FILE_FORMAT_VERSION;
@@ -432,7 +433,6 @@ static void do_persistent_allow_list(struct callback_head *_cb)
     loff_t off = 0;
     int i;
 
-    const struct cred *saved = override_creds(ksu_cred);
     struct file *fp = filp_open(KERNEL_SU_ALLOWLIST, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (IS_ERR(fp)) {
         pr_err("save_allow_list create file failed: %ld\n", PTR_ERR(fp));
@@ -450,48 +450,36 @@ static void do_persistent_allow_list(struct callback_head *_cb)
         goto close_file;
     }
 
-    mutex_lock(&allowlist_mutex);
     hash_for_each (allow_list, i, p, list) {
         pr_info("save allow list, name: %s uid :%d, allow: %d\n", p->profile.key, p->profile.curr_uid,
                 p->profile.allow_su);
 
         kernel_write(fp, &p->profile, sizeof(p->profile), &off);
     }
-    mutex_unlock(&allowlist_mutex);
 
 close_file:
     filp_close(fp, 0);
 out:
-    revert_creds(saved);
-    kfree(_cb);
+    return;
+}
+
+static int persistent_allow_list_pre(void *data)
+{
+    pr_info("do_persistent_allow_list: pid: %d started\n", current->pid);
+
+    mutex_lock(&allowlist_mutex);
+    escape_to_root_forced(); // give permissions for everything
+    do_persistent_allow_list();
+    mutex_unlock(&allowlist_mutex);
+
+    pr_info("do_persistent_allow_list: pid: %d exit\n", current->pid);
+
+    return 0;
 }
 
 void ksu_persistent_allow_list()
 {
-    struct task_struct *tsk;
-
-    rcu_read_lock();
-    tsk = get_pid_task(find_vpid(1), PIDTYPE_PID);
-    if (!tsk) {
-        rcu_read_unlock();
-        pr_err("save_allow_list find init task err\n");
-        return;
-    }
-    rcu_read_unlock();
-
-    struct callback_head *cb = kzalloc(sizeof(struct callback_head), GFP_KERNEL);
-    if (!cb) {
-        pr_err("save_allow_list alloc cb err\b");
-        goto put_task;
-    }
-    cb->func = do_persistent_allow_list;
-    if (task_work_add(tsk, cb, TWA_RESUME)) {
-        kfree(cb);
-        pr_warn("save_allow_list add task_work failed\n");
-    }
-
-put_task:
-    put_task_struct(tsk);
+    kthread_run(persistent_allow_list_pre, NULL, "allowlist");
 }
 
 void ksu_load_allow_list()
