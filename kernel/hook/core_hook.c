@@ -50,9 +50,103 @@ static struct security_hook_list ksu_hooks_temp[] = {
 };
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0) || defined(KSU_COMPAT_SECURITY_DELETE_HOOKS_HLIST)
-#define delete_lsm_entry hlist_del_rcu
+static void ksu_hlist_del_safe(struct hlist_node *n)
+{
+	struct hlist_node *next = n->next;
+	struct hlist_node **pprev = n->pprev;
+
+	if (!pprev)
+		return;
+
+	// on hlist, pprev is the address of the 'next' pointer in the prev element
+	unsigned long addr = (unsigned long)pprev;
+	unsigned long base = addr & PAGE_MASK;
+	unsigned long offset = addr & ~PAGE_MASK;
+
+	struct page *page = phys_to_page(__pa(base));
+	if (!page)
+		return;
+
+	// vmap pprev
+	void *writable_addr = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
+	if (!writable_addr)
+		return;
+
+	struct hlist_node **target_slot = (void *)((unsigned long)writable_addr + offset);
+
+	preempt_disable();
+
+	WRITE_ONCE(*target_slot, next);
+
+	// use our pprev as the new pprev for the next in chain
+	if (next)
+		WRITE_ONCE(next->pprev, pprev)
+	
+	smp_mb();
+
+	preempt_enable();
+
+	vunmap(writable_addr);
+}
+#define delete_lsm_entry ksu_hlist_del_safe
 #else
-#define delete_lsm_entry list_del_rcu
+static void ksu_list_del_safe(struct list_head *entry)
+{
+	struct list_head *next = entry->next;
+	struct list_head *prev = entry->prev;
+
+	// on a linked list we have to patch both the before us and the next to us
+	if (!prev || !next)
+		return;
+
+	// smash prev->next, basically we write 'next' into 'prev->next'
+	unsigned long addr_p = (unsigned long)&prev->next;
+	unsigned long base_p = addr_p & PAGE_MASK;
+	unsigned long offset_p = addr_p & ~PAGE_MASK;
+
+	struct page *page_p = phys_to_page(__pa(base_p));
+	if (!page_p)
+		return;
+
+	void *w_page = vmap(&page_p, 1, VM_MAP, PAGE_KERNEL);
+	if (!w_page)
+		return;
+
+	struct list_head **target = (void *)((unsigned long)w_page + offset_p);
+	
+	preempt_disable();
+
+	WRITE_ONCE(*target, next);
+
+	preempt_enable();
+	vunmap(w_page);
+
+	// smash next->prev, basically we need to write 'prev' into 'next->prev'
+	unsigned long addr_n = (unsigned long)&next->prev;
+	unsigned long base_n = addr_n & PAGE_MASK;
+	unsigned long offset_n = addr_n & ~PAGE_MASK;
+
+	struct page *page_n = phys_to_page(__pa(base_n));
+	if (!page_n)
+		return;
+
+	w_page = vmap(&page_n, 1, VM_MAP, PAGE_KERNEL);
+	if (w_page)
+		return;
+	
+	target = (void *)((unsigned long)w_page + offset_n);
+
+	preempt_disable();
+
+	WRITE_ONCE(*target, prev);
+
+	preempt_enable();
+	vunmap(w_page);
+
+	smp_mb();
+
+}
+#define delete_lsm_entry ksu_list_del_safe
 #endif
 
 // see security_delete_hooks
